@@ -1,3 +1,6 @@
+// ==================== whxwm_desktop.c ====================
+// Улучшенный оконный менеджер с поддержкой десктопов
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -10,6 +13,16 @@
 #include <ctype.h>
 #include <signal.h>
 #include <errno.h>
+#include <stdbool.h>
+
+// ==================== КОНСТАНТЫ ====================
+
+#define MAX_DESKTOPS 10
+#define DEFAULT_DESKTOPS 4
+#define MIN_WINDOW_WIDTH 100
+#define MIN_WINDOW_HEIGHT 100
+#define ANIMATION_STEPS 10
+#define ANIMATION_DELAY 10000  // микросекунды
 
 // ==================== СТРУКТУРЫ ====================
 
@@ -20,8 +33,8 @@ typedef struct Client {
     int width, height;
     int float_x, float_y;
     int float_width, float_height;
-    int is_float;
-    int is_discord;
+    int desktop;                // Номер рабочего стола (-1 = все)
+    unsigned int flags;         // Битовая маска флагов
     struct Client *prev;
     struct Client *next;
 } Client;
@@ -55,10 +68,24 @@ typedef struct {
     int drag_start_x, drag_start_y;
     int drag_orig_x, drag_orig_y;
     Client *drag_client;
+    
+    // Десктопы
+    int current_desktop;
+    int desktop_count;
+    char desktop_names[MAX_DESKTOPS][32];
+    int desktop_wallpapers[MAX_DESKTOPS];  // Цвета фона для десктопов
 } WM;
+
+// Флаги клиентов
+#define CLIENT_FLOAT     (1 << 0)
+#define CLIENT_DISCORD   (1 << 1)
+#define CLIENT_HIDDEN    (1 << 2)
+#define CLIENT_STICKY    (1 << 3)    // Виден на всех десктопах
+#define CLIENT_MINIMIZED (1 << 4)
 
 // ==================== ПРОТОТИПЫ ФУНКЦИЙ ====================
 
+// Основные функции
 void arrange_windows(WM *wm);
 void toggle_float(WM *wm, Client *c);
 void move_window_up(WM *wm);
@@ -66,12 +93,27 @@ void move_window_down(WM *wm);
 void scroll_down(WM *wm);
 void scroll_up(WM *wm);
 
+// Функции десктопов
+void init_desktops(WM *wm);
+void switch_desktop(WM *wm, int desktop);
+void next_desktop(WM *wm);
+void prev_desktop(WM *wm);
+void send_to_desktop(WM *wm, Client *c, int desktop);
+void toggle_sticky(WM *wm, Client *c);
+void draw_desktop_indicator(WM *wm);
+void draw_desktop_bar(WM *wm);
+
+// Анимация
+void animate_window_move(Client *c, int target_x, int target_y);
+void animate_window_resize(Client *c, int target_w, int target_h);
+
 // ==================== ОБРАБОТЧИК ОШИБОК ====================
 
 static int error_handler(Display *dpy, XErrorEvent *ev) {
     char buf[256];
     XGetErrorText(dpy, ev->error_code, buf, sizeof(buf));
     
+    // Игнорируем некритические ошибки
     if (ev->error_code == BadWindow || 
         ev->error_code == BadMatch ||
         ev->error_code == BadDrawable ||
@@ -82,6 +124,7 @@ static int error_handler(Display *dpy, XErrorEvent *ev) {
     
     fprintf(stderr, "X Error: %s (request code: %d, minor: %d)\n", 
             buf, ev->request_code, ev->minor_code);
+    fprintf(stderr, "  Resource ID: 0x%lx\n", ev->resourceid);
     return 0;
 }
 
@@ -90,7 +133,23 @@ static int error_handler(Display *dpy, XErrorEvent *ev) {
 int count_clients(Client *head) {
     int count = 0;
     Client *c = head;
-    while (c) { count++; c = c->next; }
+    while (c) { 
+        if (!(c->flags & CLIENT_HIDDEN)) count++;
+        c = c->next; 
+    }
+    return count;
+}
+
+int count_clients_on_desktop(Client *head, int desktop) {
+    int count = 0;
+    Client *c = head;
+    while (c) {
+        if (!(c->flags & CLIENT_HIDDEN) && 
+            (c->flags & CLIENT_STICKY || c->desktop == desktop || c->desktop == -1)) {
+            count++;
+        }
+        c = c->next;
+    }
     return count;
 }
 
@@ -106,6 +165,17 @@ Client* find_client_by_frame(WM *wm, Window frame) {
     return NULL;
 }
 
+Client* find_active_client_on_desktop(WM *wm, int desktop) {
+    // Сначала ищем активный клиент на текущем десктопе
+    for (Client *c = wm->head; c; c = c->next) {
+        if (!(c->flags & CLIENT_HIDDEN) && 
+            (c->flags & CLIENT_STICKY || c->desktop == desktop || c->desktop == -1)) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
 void spawn_command(WM *wm, const char *cmd) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -116,19 +186,51 @@ void spawn_command(WM *wm, const char *cmd) {
     }
 }
 
+// ==================== АНИМАЦИЯ ====================
+
+void animate_window_move(Client *c, int target_x, int target_y) {
+    if (!c) return;
+    
+    int start_x = c->x;
+    int start_y = c->y;
+    
+    for (int i = 0; i <= ANIMATION_STEPS; i++) {
+        float t = (float)i / ANIMATION_STEPS;
+        int x = start_x + (target_x - start_x) * t;
+        int y = start_y + (target_y - start_y) * t;
+        XMoveWindow(wm->dpy, c->frame, x, y);
+        usleep(ANIMATION_DELAY / ANIMATION_STEPS);
+    }
+}
+
+void animate_window_resize(Client *c, int target_w, int target_h) {
+    if (!c) return;
+    
+    int start_w = c->width;
+    int start_h = c->height;
+    
+    for (int i = 0; i <= ANIMATION_STEPS; i++) {
+        float t = (float)i / ANIMATION_STEPS;
+        int w = start_w + (target_w - start_w) * t;
+        int h = start_h + (target_h - start_h) * t;
+        XResizeWindow(wm->dpy, c->frame, w, h);
+        usleep(ANIMATION_DELAY / ANIMATION_STEPS);
+    }
+}
+
 // ==================== ЛОГИКА УПРАВЛЕНИЯ ОКНАМИ ====================
 
 void toggle_float(WM *wm, Client *c) {
     if (!c) return;
     
-    if (c->is_float) {
-        c->is_float = 0;
+    if (c->flags & CLIENT_FLOAT) {
+        c->flags &= ~CLIENT_FLOAT;
         c->float_x = c->x;
         c->float_y = c->y;
         c->float_width = c->width;
         c->float_height = c->height;
     } else {
-        c->is_float = 1;
+        c->flags |= CLIENT_FLOAT;
         if (c->float_width == 0) {
             c->float_width = c->width;
             c->float_height = c->height;
@@ -140,7 +242,7 @@ void toggle_float(WM *wm, Client *c) {
 }
 
 void move_window_up(WM *wm) {
-    if (!wm->active || !wm->active->is_float) return;
+    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
     
     Client *c = wm->active;
     c->float_y -= 20;
@@ -148,18 +250,153 @@ void move_window_up(WM *wm) {
 }
 
 void move_window_down(WM *wm) {
-    if (!wm->active || !wm->active->is_float) return;
+    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
     
     Client *c = wm->active;
     c->float_y += 20;
     arrange_windows(wm);
 }
 
+void toggle_sticky(WM *wm, Client *c) {
+    if (!c) return;
+    c->flags ^= CLIENT_STICKY;
+    arrange_windows(wm);
+}
+
+// ==================== ЛОГИКА ДЕСКТОПОВ ====================
+
+void init_desktops(WM *wm) {
+    wm->desktop_count = DEFAULT_DESKTOPS;
+    wm->current_desktop = 0;
+    
+    // Названия десктопов
+    const char *names[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
+    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
+        strncpy(wm->desktop_names[i], names[i], 31);
+        wm->desktop_names[i][31] = '\0';
+    }
+    
+    // Цвета фона для каждого десктопа
+    int colors[] = {
+        0x2B1E16,  // Темно-коричневый
+        0x1A2B1E,  // Темно-зеленый
+        0x1E1A2B,  // Темно-фиолетовый
+        0x2B1A1E,  // Темно-красный
+        0x1A2B2B,  // Темно-синий
+        0x2B2B1A,  // Темно-желтый
+        0x2B1A2B,  // Темно-розовый
+        0x1A2B1A,  // Зеленый
+        0x2B2B2B,  // Серый
+        0x1A1A2B   // Темно-синий
+    };
+    
+    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
+        wm->desktop_wallpapers[i] = colors[i % 10];
+    }
+}
+
+void switch_desktop(WM *wm, int desktop) {
+    if (desktop < 0 || desktop >= wm->desktop_count || desktop == wm->current_desktop) {
+        return;
+    }
+    
+    // Скрываем все окна на старом десктопе
+    Client *c;
+    for (c = wm->head; c; c = c->next) {
+        if (!(c->flags & CLIENT_STICKY) && c->desktop == wm->current_desktop) {
+            XUnmapWindow(wm->dpy, c->frame);
+        }
+    }
+    
+    wm->current_desktop = desktop;
+    
+    // Устанавливаем фон рабочего стола
+    XSetWindowBackground(wm->dpy, wm->root, wm->desktop_wallpapers[desktop]);
+    XClearWindow(wm->dpy, wm->root);
+    
+    // Показываем окна на новом десктопе
+    arrange_windows(wm);
+    draw_desktop_bar(wm);
+    
+    // Находим активное окно на новом десктопе
+    wm->active = find_active_client_on_desktop(wm, desktop);
+    arrange_windows(wm);
+}
+
+void next_desktop(WM *wm) {
+    int next = (wm->current_desktop + 1) % wm->desktop_count;
+    switch_desktop(wm, next);
+}
+
+void prev_desktop(WM *wm) {
+    int prev = (wm->current_desktop - 1 + wm->desktop_count) % wm->desktop_count;
+    switch_desktop(wm, prev);
+}
+
+void send_to_desktop(WM *wm, Client *c, int desktop) {
+    if (!c || desktop < 0 || desktop >= wm->desktop_count) return;
+    
+    c->desktop = desktop;
+    arrange_windows(wm);
+    draw_desktop_bar(wm);
+}
+
+// ==================== ОТРИСОВКА ПАНЕЛИ ДЕСКТОПОВ ====================
+
+void draw_desktop_bar(WM *wm) {
+    // Используем простую отрисовку через X
+    int bar_height = 30;
+    int bar_y = wm->screen_height - bar_height;
+    
+    // Очищаем панель
+    XSetWindowBackground(wm->dpy, wm->root, wm->desktop_wallpapers[wm->current_desktop]);
+    XClearWindow(wm->dpy, wm->root);
+    
+    // Рисуем панель
+    GC gc = XCreateGC(wm->dpy, wm->root, 0, NULL);
+    XSetForeground(wm->dpy, gc, 0x333333);
+    XFillRectangle(wm->dpy, wm->root, gc, 0, bar_y, wm->screen_width, bar_height);
+    
+    // Рисуем индикаторы десктопов
+    int indicator_width = 60;
+    int indicator_height = 20;
+    int total_width = wm->desktop_count * (indicator_width + 10);
+    int start_x = (wm->screen_width - total_width) / 2;
+    int indicator_y = bar_y + (bar_height - indicator_height) / 2;
+    
+    for (int i = 0; i < wm->desktop_count; i++) {
+        int x = start_x + i * (indicator_width + 10);
+        
+        // Фон индикатора
+        if (i == wm->current_desktop) {
+            XSetForeground(wm->dpy, gc, 0xD4A05A);  // Активный
+        } else {
+            XSetForeground(wm->dpy, gc, 0x555555);  // Неактивный
+        }
+        XFillRectangle(wm->dpy, wm->root, gc, x, indicator_y, indicator_width, indicator_height);
+        
+        // Подсчет окон на десктопе
+        int count = count_clients_on_desktop(wm->head, i);
+        char label[32];
+        snprintf(label, sizeof(label), "%s (%d)", wm->desktop_names[i], count);
+        
+        // Текст
+        XSetForeground(wm->dpy, gc, 0xFFFFFF);
+        XDrawString(wm->dpy, wm->root, gc, x + 5, indicator_y + 15, label, strlen(label));
+    }
+    
+    XFreeGC(wm->dpy, gc);
+    XSync(wm->dpy, False);
+}
+
 // ==================== ЛОГИКА ХОЛСТА И СКРОЛЛА ====================
 
 void arrange_windows(WM *wm) {
-    int count = count_clients(wm->head);
-    if (count == 0) return;
+    int count = count_clients_on_desktop(wm->head, wm->current_desktop);
+    if (count == 0) {
+        draw_desktop_bar(wm);
+        return;
+    }
     
     wm->gap = 10;
     wm->window_height = (wm->screen_height * 80) / 100;
@@ -169,77 +406,96 @@ void arrange_windows(WM *wm) {
     int i = 0;
     
     while (c != NULL) {
-        int x, y, w, h;
+        // Проверяем, принадлежит ли окно текущему десктопу
+        bool visible = (c->flags & CLIENT_STICKY) || 
+                       c->desktop == wm->current_desktop || 
+                       c->desktop == -1;
         
-        if (c->is_float) {
-            x = c->float_x;
-            y = c->float_y;
-            w = c->float_width;
-            h = c->float_height;
+        if (!(c->flags & CLIENT_HIDDEN) && visible) {
+            int x, y, w, h;
             
-            if (x + w > wm->screen_width) x = wm->screen_width - w;
-            if (y + h > wm->screen_height) y = wm->screen_height - h;
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            
-            XMapWindow(wm->dpy, c->frame);
-        } else {
-            y = i * (wm->window_height + wm->gap) - wm->scroll_offset;
-            x = wm->gap;
-            w = wm->window_width;
-            h = wm->window_height;
-            
-            if (y + h < -50 || y > wm->screen_height + 50) {
-                XUnmapWindow(wm->dpy, c->frame);
-                c = c->next;
-                i++;
-                continue;
-            } else {
+            if (c->flags & CLIENT_FLOAT) {
+                x = c->float_x;
+                y = c->float_y;
+                w = c->float_width;
+                h = c->float_height;
+                
+                // Ограничения
+                if (x + w > wm->screen_width) x = wm->screen_width - w;
+                if (y + h > wm->screen_height - 30) y = wm->screen_height - h - 30;
+                if (x < 0) x = 0;
+                if (y < 0) y = 0;
+                
                 XMapWindow(wm->dpy, c->frame);
+            } else {
+                y = i * (wm->window_height + wm->gap) - wm->scroll_offset;
+                x = wm->gap;
+                w = wm->window_width;
+                h = wm->window_height;
+                
+                if (y + h < -50 || y > wm->screen_height + 50) {
+                    XUnmapWindow(wm->dpy, c->frame);
+                    c = c->next;
+                    i++;
+                    continue;
+                } else {
+                    XMapWindow(wm->dpy, c->frame);
+                }
             }
+            
+            XMoveResizeWindow(wm->dpy, c->frame, x, y, w, h);
+            
+            int border = wm->border_width;
+            int title_h = wm->title_height;
+            XMoveResizeWindow(wm->dpy, c->window,
+                              border, title_h + border,
+                              w - border * 2,
+                              h - title_h - border * 2);
+            
+            c->x = x;
+            c->y = y;
+            c->width = w;
+            c->height = h;
+        } else {
+            XUnmapWindow(wm->dpy, c->frame);
         }
-        
-        XMoveResizeWindow(wm->dpy, c->frame, x, y, w, h);
-        
-        int border = wm->border_width;
-        int title_h = wm->title_height;
-        XMoveResizeWindow(wm->dpy, c->window,
-                          border, title_h + border,
-                          w - border * 2,
-                          h - title_h - border * 2);
-        
-        c->x = x;
-        c->y = y;
-        c->width = w;
-        c->height = h;
         
         c = c->next;
         i++;
     }
     
+    // Обновляем границы
     for (c = wm->head; c; c = c->next) {
-        if (c == wm->active) {
-            XSetWindowBorder(wm->dpy, c->frame, 0xD4A05A);
-            XRaiseWindow(wm->dpy, c->frame);
-        } else {
-            XSetWindowBorder(wm->dpy, c->frame, 0x2B1E16);
+        bool visible = (c->flags & CLIENT_STICKY) || 
+                       c->desktop == wm->current_desktop || 
+                       c->desktop == -1;
+        
+        if (visible && !(c->flags & CLIENT_HIDDEN)) {
+            if (c == wm->active) {
+                XSetWindowBorder(wm->dpy, c->frame, 0xD4A05A);
+                XRaiseWindow(wm->dpy, c->frame);
+            } else {
+                XSetWindowBorder(wm->dpy, c->frame, 0x2B1E16);
+            }
         }
     }
     
+    draw_desktop_bar(wm);
     XSync(wm->dpy, False);
 }
 
 // ==================== ПРОКРУТКА ====================
 
 void scroll_down(WM *wm) {
-    if (count_clients(wm->head) == 0) return;
+    if (count_clients_on_desktop(wm->head, wm->current_desktop) == 0) return;
     wm->scroll_offset += (wm->window_height + wm->gap);
     arrange_windows(wm);
 }
 
 void scroll_up(WM *wm) {
-    if (count_clients(wm->head) == 0) return;
+    if (count_clients_on_desktop(wm->head, wm->current_desktop) == 0) return;
     wm->scroll_offset -= (wm->window_height + wm->gap);
+    if (wm->scroll_offset < 0) wm->scroll_offset = 0;
     arrange_windows(wm);
 }
 
@@ -285,7 +541,7 @@ int should_manage_window(WM *wm, Window window) {
         return 0;
     }
     
-    if (attrs.width < 100 || attrs.height < 100) {
+    if (attrs.width < MIN_WINDOW_WIDTH || attrs.height < MIN_WINDOW_HEIGHT) {
         return 0;
     }
     
@@ -345,6 +601,7 @@ void manage_new_window(WM *wm, Window window) {
     
     Client *client = calloc(1, sizeof(Client));
     if (!client) {
+        fprintf(stderr, "Failed to allocate memory for client\n");
         XDestroyWindow(wm->dpy, frame);
         XMapWindow(wm->dpy, window);
         return;
@@ -352,16 +609,18 @@ void manage_new_window(WM *wm, Window window) {
     
     client->window = window;
     client->frame = frame;
-    client->is_discord = is_discord;
+    client->desktop = wm->current_desktop;
+    client->flags = 0;
     
     if (is_discord) {
-        client->is_float = 1;
+        client->flags |= CLIENT_FLOAT | CLIENT_DISCORD;
         client->float_width = wm->screen_width * 0.8;
         client->float_height = wm->screen_height * 0.8;
         client->float_x = (wm->screen_width - client->float_width) / 2;
         client->float_y = (wm->screen_height - client->float_height) / 2;
     }
     
+    // Добавляем клиент в список
     if (!wm->head) {
         wm->head = client;
         wm->active = client;
@@ -422,8 +681,13 @@ void parse_config(WM *wm) {
     const char *path = "/home/doogike/C-basics/whxwm/whxwm.conf";
     FILE *f = fopen(path, "r");
     if (!f) {
-        fprintf(stderr, "Config not found at %s. Using defaults.\n", path);
-        return;
+        // Пробуем альтернативные пути
+        path = "/etc/whxwm/whxwm.conf";
+        f = fopen(path, "r");
+        if (!f) {
+            fprintf(stderr, "Config not found. Using defaults.\n");
+            return;
+        }
     }
     
     char line[512];
@@ -442,6 +706,15 @@ void parse_config(WM *wm) {
         char *end = key_part + strlen(key_part) - 1;
         while (end > key_part && (*end == ' ' || *end == '\t')) *end-- = '\0';
         while (*cmd_part == ' ' || *cmd_part == '\t') cmd_part++;
+        
+        // Проверяем специальные команды для десктопов
+        if (strcmp(key_part, "desktops") == 0) {
+            int count = atoi(cmd_part);
+            if (count > 0 && count <= MAX_DESKTOPS) {
+                wm->desktop_count = count;
+            }
+            continue;
+        }
         
         char mod_str[32] = {0};
         char key_str[32] = {0};
@@ -469,11 +742,14 @@ void parse_config(WM *wm) {
         else if (strcmp(key_str, "Space") == 0) kb->keysym = XK_space;
         else if (strcmp(key_str, "Up") == 0) kb->keysym = XK_Up;
         else if (strcmp(key_str, "Down") == 0) kb->keysym = XK_Down;
+        else if (strcmp(key_str, "Left") == 0) kb->keysym = XK_Left;
+        else if (strcmp(key_str, "Right") == 0) kb->keysym = XK_Right;
         else if (strlen(key_str) == 1) kb->keysym = XStringToKeysym(key_str);
         else kb->keysym = XStringToKeysym(key_str);
         
         if (kb->keysym != NoSymbol) {
-            printf("Loaded keybind: Mod=%d, KeySym='%s', Command='%s'\n", kb->mod, key_str, kb->command);
+            printf("Loaded keybind: Mod=%d, KeySym='%s', Command='%s'\n", 
+                   kb->mod, key_str, kb->command);
             
             XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, kb->keysym), kb->mod,
                      wm->root, True, GrabModeAsync, GrabModeAsync);
@@ -506,29 +782,64 @@ void handle_key_press(WM *wm, XKeyEvent *ev) {
     KeySym keysym = XLookupKeysym(ev, 0);
     unsigned int state = ev->state & (Mod4Mask | Mod1Mask | ControlMask | ShiftMask);
     
+    // Глобальные хоткеи
     if (state == Mod4Mask && keysym == XK_q) { 
         if (wm->active) close_window(wm, wm->active->window); 
         return; 
     }
-    if (state == Mod4Mask && keysym == XK_j) { scroll_down(wm); return; }
-    if (state == Mod4Mask && keysym == XK_k) { scroll_up(wm); return; }
     
-    if (state == Mod4Mask && keysym == XK_space) {
-        if (wm->active) {
-            toggle_float(wm, wm->active);
+    // Навигация по десктопам
+    if (state == Mod4Mask && keysym == XK_1) { switch_desktop(wm, 0); return; }
+    if (state == Mod4Mask && keysym == XK_2) { switch_desktop(wm, 1); return; }
+    if (state == Mod4Mask && keysym == XK_3) { switch_desktop(wm, 2); return; }
+    if (state == Mod4Mask && keysym == XK_4) { switch_desktop(wm, 3); return; }
+    if (state == Mod4Mask && keysym == XK_5) { switch_desktop(wm, 4); return; }
+    if (state == Mod4Mask && keysym == XK_6) { switch_desktop(wm, 5); return; }
+    if (state == Mod4Mask && keysym == XK_7) { switch_desktop(wm, 6); return; }
+    if (state == Mod4Mask && keysym == XK_8) { switch_desktop(wm, 7); return; }
+    if (state == Mod4Mask && keysym == XK_9) { switch_desktop(wm, 8); return; }
+    if (state == Mod4Mask && keysym == XK_0) { switch_desktop(wm, 9); return; }
+    
+    if (state == (Mod4Mask | ControlMask) && keysym == XK_Right) { next_desktop(wm); return; }
+    if (state == (Mod4Mask | ControlMask) && keysym == XK_Left) { prev_desktop(wm); return; }
+    
+    // Отправка окна на другой десктоп
+    if (state == (Mod4Mask | ShiftMask) && keysym >= XK_1 && keysym <= XK_9) {
+        int desktop = keysym - XK_1;
+        if (desktop < wm->desktop_count && wm->active) {
+            send_to_desktop(wm, wm->active, desktop);
         }
         return;
     }
     
-    if (state == Mod4Mask && keysym == XK_Up) {
-        move_window_up(wm);
-        return;
-    }
-    if (state == Mod4Mask && keysym == XK_Down) {
-        move_window_down(wm);
+    if (state == (Mod4Mask | ShiftMask) && keysym == XK_0) {
+        if (wm->active && wm->desktop_count > 9) {
+            send_to_desktop(wm, wm->active, 9);
+        }
         return;
     }
     
+    // Закрепить окно на всех десктопах
+    if (state == (Mod4Mask | ControlMask) && keysym == XK_s) {
+        if (wm->active) toggle_sticky(wm, wm->active);
+        return;
+    }
+    
+    // Прокрутка
+    if (state == Mod4Mask && keysym == XK_j) { scroll_down(wm); return; }
+    if (state == Mod4Mask && keysym == XK_k) { scroll_up(wm); return; }
+    
+    // Плавающий режим
+    if (state == Mod4Mask && keysym == XK_space) {
+        if (wm->active) toggle_float(wm, wm->active);
+        return;
+    }
+    
+    // Перемещение плавающих окон
+    if (state == Mod4Mask && keysym == XK_Up) { move_window_up(wm); return; }
+    if (state == Mod4Mask && keysym == XK_Down) { move_window_down(wm); return; }
+    
+    // Пользовательские биндинги
     for (Keybind *kb = wm->keybinds; kb; kb = kb->next) {
         if (state == kb->mod && keysym == kb->keysym) {
             spawn_command(wm, kb->command);
@@ -554,7 +865,7 @@ void handle_button_press(WM *wm, XButtonEvent *ev) {
         case Button5: scroll_down(wm); break;
         case Button1: 
             wm->active = c;
-            if (c->is_float) {
+            if (c->flags & CLIENT_FLOAT) {
                 wm->is_dragging = 1;
                 wm->drag_client = c;
                 wm->drag_start_x = ev->x_root;
@@ -574,7 +885,7 @@ void handle_button_press(WM *wm, XButtonEvent *ev) {
 }
 
 void handle_button_release(WM *wm, XButtonEvent *ev) {
-    (void)ev; // Подавляем предупреждение о неиспользуемом параметре
+    (void)ev;
     if (wm->is_dragging) {
         wm->is_dragging = 0;
         wm->drag_client = NULL;
@@ -591,6 +902,14 @@ void handle_motion_notify(WM *wm, XMotionEvent *ev) {
     
     c->float_x = wm->drag_orig_x + dx;
     c->float_y = wm->drag_orig_y + dy;
+    
+    // Ограничения
+    if (c->float_x < 0) c->float_x = 0;
+    if (c->float_y < 0) c->float_y = 0;
+    if (c->float_x + c->float_width > wm->screen_width) 
+        c->float_x = wm->screen_width - c->float_width;
+    if (c->float_y + c->float_height > wm->screen_height - 30) 
+        c->float_y = wm->screen_height - c->float_height - 30;
     
     XMoveWindow(wm->dpy, c->frame, c->float_x, c->float_y);
 }
@@ -650,6 +969,7 @@ void init_wm(WM *wm) {
     XSelectInput(wm->dpy, wm->root, SubstructureRedirectMask);
     XSync(wm->dpy, False);
     
+    // Проверяем, не запущен ли другой WM
     Window unused_root, unused_parent;
     Window *children;
     unsigned int nchildren;
@@ -679,6 +999,9 @@ void init_wm(WM *wm) {
     wm->is_dragging = 0;
     wm->drag_client = NULL;
     
+    // Инициализация десктопов
+    init_desktops(wm);
+    
     XSelectInput(wm->dpy, wm->root,
                  SubstructureRedirectMask | SubstructureNotifyMask |
                  StructureNotifyMask | PropertyChangeMask |
@@ -687,29 +1010,44 @@ void init_wm(WM *wm) {
     
     XSync(wm->dpy, False);
     
-    XSetWindowBackground(wm->dpy, wm->root, 0x2B1E16);
+    XSetWindowBackground(wm->dpy, wm->root, wm->desktop_wallpapers[wm->current_desktop]);
     XClearWindow(wm->dpy, wm->root);
     
+    // Граббим хоткеи
     XUngrabKey(wm->dpy, AnyKey, AnyModifier, wm->root);
     
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_q), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_j), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_k), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_space), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_Up), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(wm->dpy, XKeysymToKeycode(wm->dpy, XK_Down), Mod4Mask,
-             wm->root, True, GrabModeAsync, GrabModeAsync);
+    KeyCode keys[] = {
+        XKeysymToKeycode(wm->dpy, XK_q),
+        XKeysymToKeycode(wm->dpy, XK_j),
+        XKeysymToKeycode(wm->dpy, XK_k),
+        XKeysymToKeycode(wm->dpy, XK_space),
+        XKeysymToKeycode(wm->dpy, XK_Up),
+        XKeysymToKeycode(wm->dpy, XK_Down),
+        XKeysymToKeycode(wm->dpy, XK_Left),
+        XKeysymToKeycode(wm->dpy, XK_Right),
+    };
+    
+    for (int i = 0; i < 10; i++) {
+        KeyCode code = XKeysymToKeycode(wm->dpy, XK_0 + i);
+        XGrabKey(wm->dpy, code, Mod4Mask, wm->root, True, GrabModeAsync, GrabModeAsync);
+        XGrabKey(wm->dpy, code, Mod4Mask | ShiftMask, wm->root, True, GrabModeAsync, GrabModeAsync);
+    }
+    
+    for (int i = 0; i < sizeof(keys)/sizeof(KeyCode); i++) {
+        XGrabKey(wm->dpy, keys[i], Mod4Mask, wm->root, True, GrabModeAsync, GrabModeAsync);
+    }
+    
+    // Дополнительные хоткеи
+    KeyCode s_code = XKeysymToKeycode(wm->dpy, XK_s);
+    XGrabKey(wm->dpy, s_code, Mod4Mask | ControlMask, wm->root, True, GrabModeAsync, GrabModeAsync);
     
     parse_config(wm);
     
     XSync(wm->dpy, False);
     
     printf("=== whxwm initialized successfully ===\n");
+    printf("  Desktops: %d\n", wm->desktop_count);
+    printf("  Current: %s\n", wm->desktop_names[wm->current_desktop]);
 }
 
 // ==================== ГЛАВНЫЙ ЦИКЛ ====================
@@ -767,9 +1105,10 @@ void cleanup_wm(WM *wm) {
 int main() {
     WM wm = {0};
     
-    printf("Starting whxwm...\n");
+    printf("Starting whxwm with desktop support...\n");
     
     init_wm(&wm);
+    draw_desktop_bar(&wm);
     run_wm(&wm);
     cleanup_wm(&wm);
     
