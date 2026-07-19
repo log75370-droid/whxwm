@@ -1,6 +1,9 @@
 // ==================== whxwm_desktop.c ====================
-// whxwm its a vertical scroll WM for X11
 // 1.2 version
+
+// Posix macros
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -15,6 +18,29 @@
 #include <signal.h>
 #include <errno.h>
 #include <stdbool.h>
+
+// Если strcasestr не определен, добавляем свою реализацию
+#ifndef HAVE_STRCASESTR
+// Используем другое имя, чтобы не конфликтовать с объявлением в string.h
+static char* my_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) return (char*)haystack;
+    
+    for (const char *h = haystack; *h; h++) {
+        if (tolower((unsigned char)*h) == tolower((unsigned char)*needle)) {
+            size_t i;
+            for (i = 0; i < needle_len; i++) {
+                if (tolower((unsigned char)h[i]) != tolower((unsigned char)needle[i])) break;
+            }
+            if (i == needle_len) return (char*)h;
+        }
+    }
+    return NULL;
+}
+#define strcasestr my_strcasestr
+#endif
 
 // ==================== КОНСТАНТЫ ====================
 
@@ -105,8 +131,8 @@ void draw_desktop_indicator(WM *wm);
 void draw_desktop_bar(WM *wm);
 
 // Анимация
-void animate_window_move(Client *c, int target_x, int target_y);
-void animate_window_resize(Client *c, int target_w, int target_h);
+void animate_window_move(WM *wm, Client *c, int target_x, int target_y);
+void animate_window_resize(WM *wm, Client *c, int target_w, int target_h);
 
 // ==================== ОБРАБОТЧИК ОШИБОК ====================
 
@@ -189,7 +215,7 @@ void spawn_command(WM *wm, const char *cmd) {
 
 // ==================== АНИМАЦИЯ ====================
 
-void animate_window_move(Client *c, int target_x, int target_y) {
+void animate_window_move(WM *wm, Client *c, int target_x, int target_y) {
     if (!c) return;
     
     int start_x = c->x;
@@ -204,7 +230,7 @@ void animate_window_move(Client *c, int target_x, int target_y) {
     }
 }
 
-void animate_window_resize(Client *c, int target_w, int target_h) {
+void animate_window_resize(WM *wm, Client *c, int target_w, int target_h) {
     if (!c) return;
     
     int start_w = c->width;
@@ -731,6 +757,10 @@ void parse_config(WM *wm) {
         if (!kb) continue;
         
         kb->command = strdup(cmd_part);
+        if (!kb->command) {
+            free(kb);
+            continue;
+        }
         kb->mod = 0;
         
         if (strstr(mod_str, "Super")) kb->mod |= Mod4Mask;
@@ -1034,7 +1064,8 @@ void init_wm(WM *wm) {
         XGrabKey(wm->dpy, code, Mod4Mask | ShiftMask, wm->root, True, GrabModeAsync, GrabModeAsync);
     }
     
-    for (int i = 0; i < sizeof(keys)/sizeof(KeyCode); i++) {
+    size_t num_keys = sizeof(keys) / sizeof(keys[0]);
+    for (size_t i = 0; i < num_keys; i++) {
         XGrabKey(wm->dpy, keys[i], Mod4Mask, wm->root, True, GrabModeAsync, GrabModeAsync);
     }
     
