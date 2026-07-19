@@ -1,5 +1,6 @@
 // ==================== whxwm_desktop.c ====================
-// Улучшенный оконный менеджер с поддержкой десктопов
+// whxwm its a vertical scroll WM for X11
+// 1.2 version
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
