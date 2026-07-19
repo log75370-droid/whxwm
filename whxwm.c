@@ -705,7 +705,7 @@ void close_window(WM *wm, Window window) {
 // ==================== ПАРСИНГ КОНФИГА ====================
 
 void parse_config(WM *wm) {
-    const char *path = "/home/doogike/C-basics/whxwm/whxwm.conf";
+    const char *path = "~/.config/whxwm/whxwm.conf";
     FILE *f = fopen(path, "r");
     if (!f) {
         // Пробуем альтернативные пути
