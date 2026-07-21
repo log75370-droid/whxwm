@@ -1,13 +1,17 @@
 CC = gcc
-CFAGS = -lX11 -lm -Wall -Wextra -O2
-TAGRET = whxwm whxwm.c
+CFLAGS = -Wall -Wextra -O2
+LDFLAGS = -lX11 -lXrandr -lm
+TARGET = whxwm
+SRC = whxwm.c
+
+.PHONY: clean install
 
 clean:
-  rm -f whxwm
-  rm -f ~/bin/whxwm
-install:
-  echo "compiling"
-  CC -o $(TARGET) $(CFAGS)
-  mkdir ~/bin
-  cp whxwm ~/bin
+	rm -f $(TARGET)
+	rm -f ~/bin/$(TARGET)
 
+install:
+	@echo "Compiling $(TARGET)..."
+	$(CC) -o $(TARGET) $(SRC) $(CFLAGS) $(LDFLAGS)
+	cp $(TARGET) /usr/local/bin
+	@echo "Installed to /usr/local/bin/$(TARGET)"
