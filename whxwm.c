@@ -1,11 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <X11/Xatom.h>
-#include <X11/extensions/Xrandr.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,56 +13,7 @@
 #include <time.h>
 #include <sys/wait.h>
 
-#include "config.def.h"
-
-typedef struct Client {
-    Window window;
-    Window frame;
-    int x, y;
-    int width, height;
-    int float_x, float_y;
-    int float_width, float_height;
-    int desktop;
-    unsigned int flags;
-    struct Client *prev;
-    struct Client *next;
-} Client;
-
-typedef struct {
-    Display *dpy;
-    Window root;
-    Client *head;
-    Client *active;
-    int screen_width;
-    int screen_height;
-    int monitor_x;
-    int monitor_y;
-    int monitor_width;
-    int monitor_height;
-    int scroll_offset;
-    int running;
-    int border_width;
-    int title_height;
-    int gap;
-    int window_width;
-    int window_height;
-    int error_occurred;
-    int is_dragging;
-    int drag_start_x, drag_start_y;
-    int drag_orig_x, drag_orig_y;
-    Client *drag_client;
-    int current_desktop;
-    int desktop_count;
-    char desktop_names[MAX_DESKTOPS][32];
-    int desktop_wallpapers[MAX_DESKTOPS];
-    GC gc;
-} WM;
-
-#define CLIENT_FLOAT (1 << 0)
-#define CLIENT_DISCORD (1 << 1)
-#define CLIENT_HIDDEN (1 << 2)
-#define CLIENT_STICKY (1 << 3)
-#define CLIENT_MINIMIZED (1 << 4)
+#include "whxwm.h"
 
 static int error_handler(Display *dpy, XErrorEvent *ev) {
     char buf[256];
@@ -117,13 +63,17 @@ Client* find_active_client_on_desktop(WM *wm, int desktop) {
     return NULL;
 }
 
-void spawn_command(WM *wm, const char *cmd) {
+void spawn_action(const char **cmd, void *data) {
+    if (!cmd || !cmd[0]) return;
+    
+    WM *wm = (WM*)data;
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
         close(ConnectionNumber(wm->dpy));
-        execlp("/bin/sh", "sh", "-c", cmd, NULL);
-        exit(0);
+        execvp(cmd[0], (char * const *)cmd);
+        perror("execvp");
+        exit(1);
     }
 }
 
@@ -138,6 +88,207 @@ void close_window(WM *wm, Window window) {
     ev.xclient.data.l[0] = wm_delete;
     ev.xclient.data.l[1] = CurrentTime;
     XSendEvent(wm->dpy, window, False, NoEventMask, &ev);
+}
+
+void toggle_float(WM *wm, Client *c) {
+    if (!c) return;
+    if (c->flags & CLIENT_FLOAT) {
+        c->flags &= ~CLIENT_FLOAT;
+        c->float_x = c->x;
+        c->float_y = c->y;
+        c->float_width = c->width;
+        c->float_height = c->height;
+    } else {
+        c->flags |= CLIENT_FLOAT;
+        if (c->float_width == 0) {
+            c->float_width = c->width;
+            c->float_height = c->height;
+            c->float_x = wm->monitor_x + (wm->monitor_width - c->float_width) / 2;
+            c->float_y = wm->monitor_y + (wm->monitor_height - c->float_height) / 2;
+        }
+    }
+    arrange_windows(wm);
+}
+
+void toggle_sticky(WM *wm, Client *c) {
+    if (!c) return;
+    c->flags ^= CLIENT_STICKY;
+    arrange_windows(wm);
+}
+
+void move_window_up(WM *wm) {
+    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
+    Client *c = wm->active;
+    c->float_y -= 20;
+    arrange_windows(wm);
+}
+
+void move_window_down(WM *wm) {
+    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
+    Client *c = wm->active;
+    c->float_y += 20;
+    arrange_windows(wm);
+}
+
+void init_desktops(WM *wm) {
+    wm->desktop_count = DEFAULT_DESKTOPS;
+    wm->current_desktop = 0;
+    
+    const char *names[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
+    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
+        strncpy(wm->desktop_names[i], names[i], 31);
+        wm->desktop_names[i][31] = '\0';
+    }
+    
+    int colors[] = DESKTOP_COLORS;
+    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
+        wm->desktop_wallpapers[i] = colors[i % 10];
+    }
+}
+
+void switch_desktop(WM *wm, int desktop) {
+    if (desktop < 0 || desktop >= wm->desktop_count || desktop == wm->current_desktop) {
+        return;
+    }
+    
+    Client *c;
+    for (c = wm->head; c; c = c->next) {
+        if (!(c->flags & CLIENT_STICKY) && c->desktop == wm->current_desktop) {
+            XUnmapWindow(wm->dpy, c->frame);
+        }
+    }
+    
+    wm->current_desktop = desktop;
+    
+    XSetWindowBackground(wm->dpy, wm->root, wm->desktop_wallpapers[desktop]);
+    XClearWindow(wm->dpy, wm->root);
+    
+    arrange_windows(wm);
+    draw_desktop_bar(wm);
+    
+    wm->active = find_active_client_on_desktop(wm, desktop);
+    arrange_windows(wm);
+}
+
+void next_desktop(WM *wm) {
+    int next = (wm->current_desktop + 1) % wm->desktop_count;
+    switch_desktop(wm, next);
+}
+
+void prev_desktop(WM *wm) {
+    int prev = (wm->current_desktop - 1 + wm->desktop_count) % wm->desktop_count;
+    switch_desktop(wm, prev);
+}
+
+void send_to_desktop(WM *wm, Client *c, int desktop) {
+    if (!c || desktop < 0 || desktop >= wm->desktop_count) return;
+    c->desktop = desktop;
+    arrange_windows(wm);
+    draw_desktop_bar(wm);
+}
+
+bool is_discord_window(WM *wm, Window window) {
+    char *window_name = NULL;
+    if (XFetchName(wm->dpy, window, &window_name) && window_name) {
+        if (strcasestr(window_name, "discord") || strcasestr(window_name, "Discord")) {
+            XFree(window_name);
+            return true;
+        }
+        XFree(window_name);
+    }
+    XClassHint *class_hint = XAllocClassHint();
+    if (XGetClassHint(wm->dpy, window, class_hint)) {
+        if (class_hint->res_class) {
+            if (strcasestr(class_hint->res_class, "discord") ||
+                strcasestr(class_hint->res_class, "Discord")) {
+                XFree(class_hint->res_class);
+                XFree(class_hint->res_name);
+                XFree(class_hint);
+                return true;
+            }
+        }
+        XFree(class_hint->res_class);
+        XFree(class_hint->res_name);
+        XFree(class_hint);
+    }
+    return false;
+}
+
+bool should_manage_window(WM *wm, Window window) {
+    XWindowAttributes attrs;
+    if (!XGetWindowAttributes(wm->dpy, window, &attrs)) {
+        return false;
+    }
+    if (attrs.override_redirect) {
+        return false;
+    }
+    if (attrs.width < 100 || attrs.height < 100) {
+        return false;
+    }
+    Atom wm_type = XInternAtom(wm->dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    
+    if (XGetWindowProperty(wm->dpy, window, wm_type, 0, 1024, False, 
+                           XA_ATOM, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success && prop) {
+        Atom *types = (Atom*)prop;
+        int result = 1;
+        for (unsigned long i = 0; i < nitems; i++) {
+            char *name = XGetAtomName(wm->dpy, types[i]);
+            if (name) {
+                if (strstr(name, "_NET_WM_WINDOW_TYPE_DOCK") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_DESKTOP") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_MENU") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_TOOLTIP") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_NOTIFICATION") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_SPLASH") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_UTILITY") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_DIALOG") ||
+                    strstr(name, "_NET_WM_WINDOW_TYPE_POPUP_MENU")) {
+                    result = 0;
+                }
+                XFree(name);
+            }
+        }
+        XFree(prop);
+        if (!result) return false;
+    }
+    return true;
+}
+
+void apply_rules(WM *wm, Client *c) {
+    char *class_hint = NULL;
+    char *window_name = NULL;
+    
+    XClassHint *class = XAllocClassHint();
+    if (XGetClassHint(wm->dpy, c->window, class)) {
+        if (class->res_class) class_hint = class->res_class;
+    }
+    XFetchName(wm->dpy, c->window, &window_name);
+    
+    for (unsigned int i = 0; i < NUM_RULES; i++) {
+        int match = 0;
+        if (rules[i].window_class && class_hint) {
+            if (strcasestr(class_hint, rules[i].window_class)) match = 1;
+        }
+        if (rules[i].window_title && window_name) {
+            if (strcasestr(window_name, rules[i].window_title)) match = 1;
+        }
+        if (match) {
+            if (rules[i].desktop >= 0) c->desktop = rules[i].desktop;
+            if (rules[i].floating) c->flags |= CLIENT_FLOAT;
+            if (rules[i].sticky) c->flags |= CLIENT_STICKY;
+            if (rules[i].width > 0) c->float_width = rules[i].width;
+            if (rules[i].height > 0) c->float_height = rules[i].height;
+            break;
+        }
+    }
+    
+    if (class) XFree(class);
+    if (window_name) XFree(window_name);
 }
 
 void draw_desktop_bar(WM *wm) {
@@ -226,14 +377,12 @@ void arrange_windows(WM *wm) {
                     XMapWindow(wm->dpy, c->frame);
                     XMoveResizeWindow(wm->dpy, c->frame, x, y, w, h);
                     
-                    // --- ИСПРАВЛЕНИЕ: растягиваем само окно внутри рамки ---
                     int inner_x = wm->border_width;
                     int inner_y = wm->title_height + wm->border_width;
                     int inner_w = w - (wm->border_width * 2);
                     int inner_h = h - wm->title_height - (wm->border_width * 2);
                     
                     XMoveResizeWindow(wm->dpy, c->window, inner_x, inner_y, inner_w, inner_h);
-                    // -------------------------------------------------------
                 }
             }
             
@@ -377,207 +526,6 @@ void scroll_to_window(WM *wm, Client *target) {
     
     wm->scroll_offset = center_offset;
     arrange_windows(wm);
-}
-
-void toggle_float(WM *wm, Client *c) {
-    if (!c) return;
-    if (c->flags & CLIENT_FLOAT) {
-        c->flags &= ~CLIENT_FLOAT;
-        c->float_x = c->x;
-        c->float_y = c->y;
-        c->float_width = c->width;
-        c->float_height = c->height;
-    } else {
-        c->flags |= CLIENT_FLOAT;
-        if (c->float_width == 0) {
-            c->float_width = c->width;
-            c->float_height = c->height;
-            c->float_x = wm->monitor_x + (wm->monitor_width - c->float_width) / 2;
-            c->float_y = wm->monitor_y + (wm->monitor_height - c->float_height) / 2;
-        }
-    }
-    arrange_windows(wm);
-}
-
-void toggle_sticky(WM *wm, Client *c) {
-    if (!c) return;
-    c->flags ^= CLIENT_STICKY;
-    arrange_windows(wm);
-}
-
-void move_window_up(WM *wm) {
-    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
-    Client *c = wm->active;
-    c->float_y -= 20;
-    arrange_windows(wm);
-}
-
-void move_window_down(WM *wm) {
-    if (!wm->active || !(wm->active->flags & CLIENT_FLOAT)) return;
-    Client *c = wm->active;
-    c->float_y += 20;
-    arrange_windows(wm);
-}
-
-void switch_desktop(WM *wm, int desktop) {
-    if (desktop < 0 || desktop >= wm->desktop_count || desktop == wm->current_desktop) {
-        return;
-    }
-    
-    Client *c;
-    for (c = wm->head; c; c = c->next) {
-        if (!(c->flags & CLIENT_STICKY) && c->desktop == wm->current_desktop) {
-            XUnmapWindow(wm->dpy, c->frame);
-        }
-    }
-    
-    wm->current_desktop = desktop;
-    
-    XSetWindowBackground(wm->dpy, wm->root, wm->desktop_wallpapers[desktop]);
-    XClearWindow(wm->dpy, wm->root);
-    
-    arrange_windows(wm);
-    draw_desktop_bar(wm);
-    
-    wm->active = find_active_client_on_desktop(wm, desktop);
-    arrange_windows(wm);
-}
-
-void next_desktop(WM *wm) {
-    int next = (wm->current_desktop + 1) % wm->desktop_count;
-    switch_desktop(wm, next);
-}
-
-void prev_desktop(WM *wm) {
-    int prev = (wm->current_desktop - 1 + wm->desktop_count) % wm->desktop_count;
-    switch_desktop(wm, prev);
-}
-
-void send_to_desktop(WM *wm, Client *c, int desktop) {
-    if (!c || desktop < 0 || desktop >= wm->desktop_count) return;
-    c->desktop = desktop;
-    arrange_windows(wm);
-    draw_desktop_bar(wm);
-}
-
-void init_desktops(WM *wm) {
-    wm->desktop_count = DEFAULT_DESKTOPS;
-    wm->current_desktop = 0;
-    
-    const char *names[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
-    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
-        strncpy(wm->desktop_names[i], names[i], 31);
-        wm->desktop_names[i][31] = '\0';
-    }
-    
-    int colors[] = DESKTOP_COLORS;
-    for (int i = 0; i < MAX_DESKTOPS && i < wm->desktop_count; i++) {
-        wm->desktop_wallpapers[i] = colors[i % 10];
-    }
-}
-
-int is_discord_window(WM *wm, Window window) {
-    char *window_name = NULL;
-    if (XFetchName(wm->dpy, window, &window_name) && window_name) {
-        if (strcasestr(window_name, "discord") || strcasestr(window_name, "Discord")) {
-            XFree(window_name);
-            return 1;
-        }
-        XFree(window_name);
-    }
-    XClassHint *class_hint = XAllocClassHint();
-    if (XGetClassHint(wm->dpy, window, class_hint)) {
-        if (class_hint->res_class) {
-            if (strcasestr(class_hint->res_class, "discord") ||
-                strcasestr(class_hint->res_class, "Discord")) {
-                XFree(class_hint->res_class);
-                XFree(class_hint->res_name);
-                XFree(class_hint);
-                return 1;
-            }
-        }
-        XFree(class_hint->res_class);
-        XFree(class_hint->res_name);
-        XFree(class_hint);
-    }
-    return 0;
-}
-
-int should_manage_window(WM *wm, Window window) {
-    XWindowAttributes attrs;
-    if (!XGetWindowAttributes(wm->dpy, window, &attrs)) {
-        return 0;
-    }
-    if (attrs.override_redirect) {
-        return 0;
-    }
-    if (attrs.width < 100 || attrs.height < 100) {
-        return 0;
-    }
-    Atom wm_type = XInternAtom(wm->dpy, "_NET_WM_WINDOW_TYPE", False);
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *prop = NULL;
-    
-    if (XGetWindowProperty(wm->dpy, window, wm_type, 0, 1024, False, 
-                           XA_ATOM, &actual_type, &actual_format,
-                           &nitems, &bytes_after, &prop) == Success && prop) {
-        Atom *types = (Atom*)prop;
-        int result = 1;
-        for (unsigned long i = 0; i < nitems; i++) {
-            char *name = XGetAtomName(wm->dpy, types[i]);
-            if (name) {
-                if (strstr(name, "_NET_WM_WINDOW_TYPE_DOCK") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_DESKTOP") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_MENU") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_TOOLTIP") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_NOTIFICATION") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_SPLASH") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_UTILITY") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_DIALOG") ||
-                    strstr(name, "_NET_WM_WINDOW_TYPE_POPUP_MENU")) {
-                    result = 0;
-                }
-                XFree(name);
-            }
-        }
-        XFree(prop);
-        if (!result) return 0;
-    }
-    return 1;
-}
-
-void apply_rules(WM *wm, Client *c) {
-    char *class_hint = NULL;
-    char *window_name = NULL;
-    
-    XClassHint *class = XAllocClassHint();
-    if (XGetClassHint(wm->dpy, c->window, class)) {
-        if (class->res_class) class_hint = class->res_class;
-    }
-    XFetchName(wm->dpy, c->window, &window_name);
-    
-    for (unsigned int i = 0; i < NUM_RULES; i++) {
-        int match = 0;
-        if (rules[i].window_class && class_hint) {
-            if (strcasestr(class_hint, rules[i].window_class)) match = 1;
-        }
-        if (rules[i].window_title && window_name) {
-            if (strcasestr(window_name, rules[i].window_title)) match = 1;
-        }
-        if (match) {
-            if (rules[i].desktop >= 0) c->desktop = rules[i].desktop;
-            if (rules[i].floating) c->flags |= CLIENT_FLOAT;
-            if (rules[i].sticky) c->flags |= CLIENT_STICKY;
-            if (rules[i].width > 0) c->float_width = rules[i].width;
-            if (rules[i].height > 0) c->float_height = rules[i].height;
-            break;
-        }
-    }
-    
-    if (class) XFree(class);
-    if (window_name) XFree(window_name);
 }
 
 void manage_new_window(WM *wm, Window window) {
@@ -826,22 +774,6 @@ void show_help_action(void *data) {
     (void)data;
 }
 
-void spawn_terminal_action(void *data) {
-    spawn_command((WM*)data, TERMINAL_CMD);
-}
-
-void spawn_dmenu_action(void *data) {
-    spawn_command((WM*)data, DMENU_CMD);
-}
-
-void spawn_browser_action(void *data) {
-    spawn_command((WM*)data, BROWSER_CMD);
-}
-
-void spawn_file_manager_action(void *data) {
-    spawn_command((WM*)data, FILE_MANAGER_CMD);
-}
-
 #define SWITCH_DESKTOP_FUNC(n) \
 void switch_desktop_action_##n(void *data) { \
     WM *wm = (WM*)data; \
@@ -883,7 +815,6 @@ SEND_TO_DESKTOP_FUNC(10)
 void init_hotkeys(WM *wm) {
     XUngrabKey(wm->dpy, AnyKey, AnyModifier, wm->root);
     
-    // Grab keys on root window
     for (unsigned int i = 0; i < NUM_KEYS; i++) {
         KeyCode keycode = XKeysymToKeycode(wm->dpy, keys[i].keysym);
         if (keycode == 0) continue;
@@ -898,7 +829,6 @@ void init_hotkeys(WM *wm) {
                  True, GrabModeAsync, GrabModeAsync);
     }
     
-    // Also grab keys on all existing windows
     Client *c = wm->head;
     while (c) {
         if (c->frame) {
@@ -922,7 +852,6 @@ void init_hotkeys(WM *wm) {
     XSync(wm->dpy, False);
 }
 
-// New function to grab keys on newly created windows
 void grab_keys_on_window(WM *wm, Window window) {
     if (!window) return;
     
@@ -947,8 +876,10 @@ void handle_key_press(WM *wm, XKeyEvent *ev) {
     
     for (unsigned int i = 0; i < NUM_KEYS; i++) {
         if (keys[i].keysym == keysym && keys[i].mod == state) {
-            if (keys[i].func) {
-                keys[i].func(wm);
+            if (keys[i].is_cmd) {
+                spawn_action(keys[i].func.cmd, wm);
+            } else if (keys[i].func.func) {
+                keys[i].func.func(wm);
             }
             return;
         }
@@ -977,11 +908,9 @@ void init_wm(WM *wm) {
     }
     if (children) XFree(children);
     
-    // Get primary monitor geometry
     get_primary_monitor_geometry(wm->dpy, &wm->monitor_x, &wm->monitor_y, 
                                   &wm->monitor_width, &wm->monitor_height);
     
-    // Use monitor geometry for screen size
     wm->screen_width = wm->monitor_width;
     wm->screen_height = wm->monitor_height;
     
@@ -1047,7 +976,6 @@ void run_wm(WM *wm) {
                 handle_destroy_notify(wm, &ev.xdestroywindow); 
                 break;
             case CreateNotify: {
-                // When a new window is created, grab keys on it
                 XCreateWindowEvent *cev = (XCreateWindowEvent*)&ev;
                 if (cev->window != wm->root) {
                     grab_keys_on_window(wm, cev->window);
